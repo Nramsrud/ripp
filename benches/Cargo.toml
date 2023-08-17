@@ -28,6 +28,7 @@ csv = "1"
 ark-inner-products = { path = "../inner_products" }
 ark-ip-proofs = { path = "../ip_proofs" }
 ark-dh-commitments = { path = "../dh_commitments" }
+ark-sipp = { path = "../sipp" }
 
 [[bench]]
 name = "inner_products"
@@ -53,6 +54,10 @@ harness = false
 name = "groth16_aggregation"
 path = "benches/groth16_aggregation/bench.rs"
 harness = false
+
+[[example]]
+name = "bls_sig_agg"
+path = "examples/bls_sig_agg.rs"
 
 [[example]]
 name = "groth16_aggregation"
