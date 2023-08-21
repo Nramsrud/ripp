@@ -23,15 +23,15 @@ use ark_ip_proofs::tipa::{
     structured_scalar_message::{structured_scalar_power, TIPAWithSSM},
     TIPACompatibleSetup, TIPA,
 };
-use ark_sipp::rng::FiatShamirRng;
+use ark_sipp::{SIPP, product_of_pairings_with_coeffs, rng::FiatShamirRng};
 
 use ark_std::One;
 
 use ark_std::rand::{rngs::StdRng, Rng, SeedableRng};
-use blake2::Blake2b;
+use blake2::{Blake2b, Blake2s};
 use digest::Digest;
 
-use std::{ops::MulAssign, time::Instant};
+use std::{ops::{MulAssign, Neg, Mul}, time::Instant};
 
 // Utility function to print the type of a value
 fn print_type_of<T>(_: &T) {
@@ -134,6 +134,7 @@ fn batchpairingcheck(
 fn main() {
     const LEN: usize = 512; //set size per committee
     const LEN2: usize = 64; //number of committees
+    const LEN3: usize = 511; // need n-1 to test sipp as there are n+1 elements in the vec with a power of 2 check
     type GC1 = AFGHOCommitmentG1<Bls12_381>;
     type GC2 = AFGHOCommitmentG2<Bls12_381>;
     type SC1 = PedersenCommitment<<Bls12_381 as PairingEngine>::G1Projective>;
@@ -176,16 +177,24 @@ fn main() {
 
     let mut sklist = Vec::new();
     let mut pklist = Vec::new();
+    let mut pklist2 = Vec::new();
     let mut siglist = Vec::new();
     let mut pbits = Vec::new();
+    let mut hmlist1 = Vec::new();
     
     for i in 0..LEN {
         sklist.push(Fr::rand(&mut rng));
         pklist.push(generator.mul(sklist[i].into_repr()));
         siglist.push(hm_aff.mul(sklist[i].into_repr()));
         //pbits.push(1); //need to be not bits but Fr elements of 1
+        hmlist1.push(hm);
         pbits.push(Fr::one());
     }
+
+    for i in 0..LEN3 { //for SIPP
+        pklist2.push(generator.mul(sklist[i].into_repr()));
+    }
+
 
     // sanity check on pairing check
     let leftpairing = Bls12_381::pairing(pklist[0], hm_aff);
@@ -227,10 +236,15 @@ fn main() {
     // aggregating sigs and pks
     let mut aggpk = pklist[0];
     let mut aggsig = siglist[0];
+    let mut aggsig2 = siglist[0];
 
     for i in 1..LEN {
         aggpk = aggpk + pklist[i];
         aggsig = aggsig + siglist[i];
+    }
+
+    for i in 1..LEN3 {//for SIPP
+        aggsig2 = aggsig2 + siglist[i];
     }
 
     // sanity check on pairing check
@@ -257,7 +271,194 @@ fn main() {
         generatorlist.push(<Bls12_381 as PairingEngine>::G1Projective::prime_subgroup_generator());
     }
 
-    batchpairingcheck(LEN2, &aggpklist, &hmlist, &generatorlist, &aggsiglist);
+    // batchpairingcheck(LEN2, &aggpklist, &hmlist, &generatorlist, &aggsiglist);
 
+
+    //================================================================
+
+    // SIPP proof for aggregating BLS signatures
+    println!("\nBeginning batch signature aggregation and verification via SIPP for {} number keys\n", LEN3);
+
+    //vec of hashed to curve messages
+    //vec of public keys
+    //vec of signatures
+    // calculate aggregated signature
+    //sipp.prove(<g^-1,pklist>,<aggsig,hmlist>)
+
+    //(e(pk_1,H(m1))*e(pk_2,H(m2))...e(pk_n,H(m_n))=e(g_1,aggsig) => (e(pk_1,H(m1))*e(pk_2,H(m2))...e(pk_n,H(m_n))*e(g^-1,aggsig)=1?
+
+    //A = (pklist,g^-1), B = (hmlist, aggsig), Z = 1
+
+    let g1inv = generator.neg();
+    //let g1inv_aff = g1inv.into_affine();
+
+    let gtpairing = Bls12_381::pairing(generator, siglist[0]);
+    let invgtpairing = Bls12_381::pairing(g1inv, siglist[0]);
+    let testinverse = gtpairing.mul(invgtpairing);
+
+    println!("testing inverse  : {:?}\n", testinverse.is_one());
+
+    let mut avec = Vec::new();
+    let mut bvec = Vec::new();
+
+    //make concatenated A vec
+    for i in 0..LEN3 {
+        avec.push(pklist2[i].into_affine());
+    }
+    avec.push(g1inv.into());
+    
+
+
+    //make concatenated B vec
+    for i in 0..LEN3 {
+        bvec.push(hmlist1[i].into_affine());
+    }
+
+    bvec.push(aggsig2.into_affine());
+
+    println!("A len is: {:?}, B len is; {:?}", avec.len(), bvec.len());
+
+    let mut rng = FiatShamirRng::<Blake2s>::from_seed(&to_bytes![b"one ring to rule them all"].unwrap());
+    let mut r = Vec::new();
+    for _ in 0..avec.len() {
+        r.push(Fr::rand(&mut rng));
+        //r.push(Fr::one());
+    }
+
+    let z = product_of_pairings_with_coeffs::<Bls12_381>(&avec, &bvec, &r);
+
+    println!("testing if z is one: {:?}\n", z.is_one());
+
+    println!("\tGenerating Proof of batch pairing check");
+    let mut start = Instant::now();
+
+    let proof = SIPP::<Bls12_381, Blake2s>::prove(&avec, &bvec, &r, z);
+    assert!(proof.is_ok());
+    let proof = proof.unwrap();
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Proving time: {} ms", bench);
+
+    let mut start = Instant::now();
+    let accept = SIPP::<Bls12_381, Blake2s>::verify(&avec, &bvec, &r, z, &proof);
+    assert!(accept.is_ok());
+    assert!(accept.unwrap());
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Verifier time: {} ms", bench);
+
+//============================================
+
+    println!("\nBeginning batch signature aggregation and verification via SIPP for {} number keys (64 committees of 512 == one slot)\n", LEN3*64);
+
+    let mut avec = Vec::new();
+    let mut bvec = Vec::new();
+
+    //make concatenated A vec
+    for _ in 0..64 {
+        for i in 0..LEN3 {
+            avec.push(pklist2[i].into_affine());
+        }
+    }
+    for _ in 0..64 {
+            avec.push(g1inv.into());
+    }
+
+    //make concatenated B vec
+    for _ in 0..64 {
+        for i in 0..LEN3 {
+            bvec.push(hmlist1[i].into_affine());
+        }
+    }
+    for _ in 0..64 {
+        bvec.push(aggsig2.into_affine());
+    }
+
+    println!("A len is: {:?}, B len is; {:?}", avec.len(), bvec.len());
+    println!("{:?}", avec.len().count_ones());
+
+
+    let mut rng = FiatShamirRng::<Blake2s>::from_seed(&to_bytes![b"one ring to rule them all"].unwrap());
+    let mut r = Vec::new();
+    for _ in 0..avec.len() {
+        r.push(Fr::rand(&mut rng));
+    }
+
+    let z = product_of_pairings_with_coeffs::<Bls12_381>(&avec, &bvec, &r);
+
+    println!("\tGenerating Proof of batch pairing check");
+    let mut start = Instant::now();
+
+    let proof = SIPP::<Bls12_381, Blake2s>::prove(&avec, &bvec, &r, z);
+    assert!(proof.is_ok());
+    let proof = proof.unwrap();
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Proving time: {} ms", bench);
+
+    let mut start = Instant::now();
+    let accept = SIPP::<Bls12_381, Blake2s>::verify(&avec, &bvec, &r, z, &proof);
+    assert!(accept.is_ok());
+    assert!(accept.unwrap());
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Verifier time: {} ms", bench);
+
+
+    //=================================
+
+
+    println!("\nBeginning batch signature aggregation and verification via SIPP for {} number keys ((64 committees of 512 == one slot) * 32 slots == one epoch)\n", LEN3*64*32);
+
+    let mut avec = Vec::new();
+    let mut bvec = Vec::new();
+
+    //make concatenated A vec
+    for _ in 0..32 {
+        for _ in 0..64 {
+            for i in 0..LEN3 {
+                avec.push(pklist2[i].into_affine());
+            }
+        }
+        for _ in 0..64 {
+                avec.push(g1inv.into());
+        }
+    }
+
+    //make concatenated B vec
+    for _ in 0..32 {
+        for _ in 0..64 {
+            for i in 0..LEN3 {
+                bvec.push(hmlist1[i].into_affine());
+            }
+        }
+        for _ in 0..64 {
+            bvec.push(aggsig2.into_affine());
+        }
+    }
+
+    println!("A len is: {:?}, B len is; {:?}", avec.len(), bvec.len());
+    println!("{:?}", avec.len().count_ones());
+
+
+    let mut rng = FiatShamirRng::<Blake2s>::from_seed(&to_bytes![b"one ring to rule them all"].unwrap());
+    let mut r = Vec::new();
+    for _ in 0..avec.len() {
+        r.push(Fr::rand(&mut rng));
+    }
+
+    let z = product_of_pairings_with_coeffs::<Bls12_381>(&avec, &bvec, &r);
+
+    println!("\tGenerating Proof of batch pairing check");
+    let mut start = Instant::now();
+
+    let proof = SIPP::<Bls12_381, Blake2s>::prove(&avec, &bvec, &r, z);
+    assert!(proof.is_ok());
+    let proof = proof.unwrap();
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Proving time: {} ms", bench);
+
+    let mut start = Instant::now();
+    let accept = SIPP::<Bls12_381, Blake2s>::verify(&avec, &bvec, &r, z, &proof);
+    assert!(accept.is_ok());
+    assert!(accept.unwrap());
+    let mut bench = start.elapsed().as_millis();
+    println!("\t\t Verifier time: {} ms", bench);
 
 }
